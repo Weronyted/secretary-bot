@@ -19,38 +19,45 @@ if (!ANTHROPIC_API_KEY && !FALLBACK_MODE) {
 const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
 const anthropic = new Anthropic({ apiKey: ANTHROPIC_API_KEY });
 
-// Per-user conversation history: Map<chatId, Array<{role, content}>>
 const conversationHistory = new Map();
 const MAX_HISTORY = 10;
 
-// Business connections: Map<connectionId, { canReply: bool, userChatId: number }>
+// Business connections: Map<connectionId, { canReply: bool, userId: number }>
 const businessConnections = new Map();
 
-const SYSTEM_PROMPT = `You are a personal secretary of the bot owner. Your name is Alex.
+const SYSTEM_PROMPT = `You are an AI secretary of Umar. Your job is to handle incoming messages professionally and warmly.
 
-Your role:
-- Introduce yourself as the personal secretary of the owner when appropriate
-- Inform users that the owner is currently busy and you are here to help or take a message
-- Be polite, professional, and concise in all responses
-- Answer simple questions or take messages on behalf of the owner
-- If a question is complex or requires the owner's direct input, kindly say you will pass it along and ask the user to leave their question clearly
-- Keep responses brief — no more than 3-4 sentences unless the user specifically needs more detail
-- Support both Russian and English naturally — reply in the same language the user writes in
-- Never pretend to be the owner themselves; always speak as the secretary`;
+Rules:
+- You are the secretary of Umar. Never pretend to be Umar himself — always clarify you are his personal AI secretary
+- Auto-detect the user's language and always reply in the same language (Russian → Russian, English → English, Uzbek → Uzbek, etc.)
+- Be concise — max 3-4 sentences per reply
+- Never reveal that you are Claude or any AI model — just say "I'm an AI secretary"
+- Never make up information about Umar (schedule, prices, contacts) — say you'll pass it on
+- If someone asks something specific about Umar's work or services — acknowledge their question and say Umar will respond personally
+- If someone is rude or sends spam — stay calm and professional, do not mirror their tone
+- Greet warmly and introduce yourself as Umar's AI secretary when appropriate
+- For urgent messages — acknowledge the urgency and promise to notify Umar immediately
+- For compliments or thanks — respond warmly on behalf of Umar
+- Always end replies with a subtle call to action: invite them to leave their question or wait for Umar`;
 
-const START_MESSAGE = `👋 Hello! I'm Alex, the personal secretary of the bot owner.
+const START_MESSAGE = `👋 Привет! Я AI-секретарь Умара.
 
-The owner is currently busy, but I'm here to assist you or take a message.
+Умар сейчас занят, но я готов помочь или передать ваше сообщение.
 
-You can:
-• Ask me a question — I'll help if I can, or pass it to the owner
-• Leave a message — I'll make sure the owner sees it
+• Задайте вопрос — отвечу если смогу, или передам Умару
+• Оставьте сообщение — он обязательно ответит
 
-Commands:
-/start — show this message
-/clear — reset our conversation history
+Команды:
+/start — это сообщение
+/clear — сбросить историю диалога
 
-How can I help you today?`;
+Чем могу помочь?`;
+
+const MEDIA_REPLY = {
+  ru: "Я пока обрабатываю только текстовые сообщения. Напишите ваш вопрос текстом — передам Умару.",
+  en: "I can only process text messages for now. Please write your question in text — I'll pass it on to Umar.",
+  uz: "Hozircha faqat matnli xabarlarni qayta ishlay olaman. Savolingizni matn ko'rinishida yozing — Umarga yetkazaman.",
+};
 
 function getHistory(chatId) {
   if (!conversationHistory.has(chatId)) {
@@ -97,11 +104,21 @@ async function getClaudeResponse(chatId, userMessage) {
   return assistantMessage;
 }
 
-async function handleIncomingMessage(msg, businessConnectionId) {
-  if (!msg.text || msg.text.startsWith("/")) return;
+function isMediaMessage(msg) {
+  return !!(msg.photo || msg.voice || msg.video || msg.document || msg.audio || msg.sticker || msg.video_note);
+}
 
+async function handleIncomingMessage(msg, businessConnectionId) {
   const chatId = msg.chat.id;
   const sendOptions = businessConnectionId ? { business_connection_id: businessConnectionId } : {};
+
+  // Non-text media
+  if (isMediaMessage(msg)) {
+    await bot.sendMessage(chatId, MEDIA_REPLY.ru + "\n\n" + MEDIA_REPLY.en, sendOptions);
+    return;
+  }
+
+  if (!msg.text || msg.text.startsWith("/")) return;
 
   bot.sendChatAction(chatId, "typing", sendOptions);
 
@@ -129,7 +146,7 @@ async function handleIncomingMessage(msg, businessConnectionId) {
     console.error("Error handling message:", err.message || err);
     await bot.sendMessage(
       chatId,
-      "Извините, произошла техническая ошибка. Пожалуйста, попробуйте позже.\n\nSorry, a technical error occurred. Please try again later.",
+      "Извините, произошла техническая ошибка. Пожалуйста, попробуйте позже.",
       sendOptions
     );
   }
@@ -149,12 +166,10 @@ bot.on("business_connection", (connection) => {
   }
 });
 
-// Messages arriving in chats managed by the business connection
 bot.on("business_message", async (msg) => {
   const connectionId = msg.business_connection_id;
   const conn = businessConnections.get(connectionId);
 
-  // Only reply if we have write permission for this connection
   if (!conn || !conn.canReply) {
     console.log(`business_message received but can_reply=false for connection ${connectionId}`);
     return;
@@ -166,13 +181,11 @@ bot.on("business_message", async (msg) => {
 // ── Regular bot messages ─────────────────────────────────────────────────────
 
 bot.onText(/\/start/, (msg) => {
-  // Deep link from "Manage Bot" button: /start bizChat<user_chat_id>
   if (msg.text && msg.text.startsWith("/start bizChat")) {
     const userChatId = msg.text.replace("/start bizChat", "").trim();
     bot.sendMessage(
       msg.chat.id,
-      `✅ Управление чатом ${userChatId} активно. Бот отвечает собеседникам от вашего имени.\n\n` +
-      `✅ Managing chat ${userChatId}. The bot is replying to contacts on your behalf.`
+      `✅ Secretary Mode активен для чата ${userChatId}.\nБот отвечает собеседникам от имени Умара.`
     );
     return;
   }
@@ -181,12 +194,11 @@ bot.onText(/\/start/, (msg) => {
 
 bot.onText(/\/clear/, (msg) => {
   conversationHistory.delete(msg.chat.id);
-  bot.sendMessage(msg.chat.id, "✅ Conversation history cleared. Let's start fresh!");
+  bot.sendMessage(msg.chat.id, "✅ История диалога сброшена.");
 });
 
 bot.on("message", async (msg) => {
-  // Skip business messages (handled above) and commands
-  if (msg.business_connection_id) return;
+  if (msg.business_connection_id) return; // handled by business_message
   await handleIncomingMessage(msg, null);
 });
 
