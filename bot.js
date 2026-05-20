@@ -83,17 +83,19 @@ function pushToHistory(chatId, role, content) {
   }
 }
 
-function isQuotaError(error) {
+function isApiUnusableError(error) {
   if (!error) return false;
   const status = error.status || (error.error && error.error.status);
-  if (status === 429) return true;
+  if (status === 429 || status === 401) return true;
   const msg = (error.message || "").toLowerCase();
   return (
     msg.includes("credit balance") ||
     msg.includes("quota") ||
     msg.includes("rate limit") ||
     msg.includes("insufficient_quota") ||
-    msg.includes("billing")
+    msg.includes("billing") ||
+    msg.includes("invalid x-api-key") ||
+    msg.includes("authentication_error")
   );
 }
 
@@ -139,8 +141,8 @@ async function handleIncomingMessage(msg, businessConnectionId) {
       try {
         reply = await getClaudeResponse(chatId, msg.text);
       } catch (apiError) {
-        if (isQuotaError(apiError)) {
-          console.warn("Claude API quota/billing error — switching to FALLBACK_MODE:", apiError.message);
+        if (isApiUnusableError(apiError)) {
+          console.warn("Claude API error — switching to FALLBACK_MODE:", apiError.message);
           FALLBACK_MODE = true;
           reply = getFallbackResponse(msg.text);
         } else {
