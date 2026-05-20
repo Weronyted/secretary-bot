@@ -29,6 +29,7 @@ const bot = new TelegramBot(TELEGRAM_TOKEN, {
     },
   },
 });
+
 const anthropic = new Anthropic({ apiKey: ANTHROPIC_API_KEY });
 
 const conversationHistory = new Map();
@@ -65,11 +66,7 @@ const START_MESSAGE = `👋 Привет! Я AI-секретарь Умара.
 
 Чем могу помочь?`;
 
-const MEDIA_REPLY = {
-  ru: "Я пока обрабатываю только текстовые сообщения. Напишите ваш вопрос текстом — передам Умару.",
-  en: "I can only process text messages for now. Please write your question in text — I'll pass it on to Umar.",
-  uz: "Hozircha faqat matnli xabarlarni qayta ishlay olaman. Savolingizni matn ko'rinishida yozing — Umarga yetkazaman.",
-};
+const MEDIA_REPLY = "Я пока обрабатываю только текстовые сообщения. Напишите ваш вопрос текстом — передам Умару.\n\nI can only process text messages for now. Please write your question — I'll pass it on to Umar.";
 
 function getHistory(chatId) {
   if (!conversationHistory.has(chatId)) {
@@ -124,15 +121,14 @@ async function handleIncomingMessage(msg, businessConnectionId) {
   const chatId = msg.chat.id;
   const sendOptions = businessConnectionId ? { business_connection_id: businessConnectionId } : {};
 
-  // Non-text media
   if (isMediaMessage(msg)) {
-    await bot.sendMessage(chatId, MEDIA_REPLY.ru + "\n\n" + MEDIA_REPLY.en, sendOptions);
+    await bot.sendMessage(chatId, MEDIA_REPLY, sendOptions);
     return;
   }
 
   if (!msg.text || msg.text.startsWith("/")) return;
 
-  bot.sendChatAction(chatId, "typing", sendOptions);
+  bot.sendChatAction(chatId, "typing", sendOptions).catch(() => {});
 
   try {
     let reply;
@@ -154,15 +150,40 @@ async function handleIncomingMessage(msg, businessConnectionId) {
     }
 
     await bot.sendMessage(chatId, reply, sendOptions);
+    console.log(`Replied to chat ${chatId} via ${businessConnectionId ? "business" : "direct"}`);
   } catch (err) {
-    console.error("Error handling message:", err.message || err);
+    console.error("Error handling message:", err.message || err.code || err);
     await bot.sendMessage(
       chatId,
       "Извините, произошла техническая ошибка. Пожалуйста, попробуйте позже.",
       sendOptions
-    );
+    ).catch(() => {});
   }
 }
+
+// ── Patch processUpdate to handle business update types ──────────────────────
+// node-telegram-bot-api doesn't natively support business_* update types,
+// so we intercept raw updates and emit our own events.
+const _processUpdate = bot.processUpdate.bind(bot);
+bot.processUpdate = function (update) {
+  if (update.business_connection) {
+    bot.emit("business_connection", update.business_connection);
+    return;
+  }
+  if (update.business_message) {
+    bot.emit("business_message", update.business_message);
+    return;
+  }
+  if (update.edited_business_message) {
+    // ignore edits for now
+    return;
+  }
+  if (update.deleted_business_messages) {
+    // ignore deletions for now
+    return;
+  }
+  _processUpdate(update);
+};
 
 // ── Secretary Mode: business connection lifecycle ────────────────────────────
 
@@ -182,13 +203,12 @@ bot.on("business_message", async (msg) => {
   const connectionId = msg.business_connection_id;
   const conn = businessConnections.get(connectionId);
 
-  // If we missed the business_connection update (e.g. bot restarted), still reply.
-  // Telegram will return an error on sendMessage if can_reply is actually false.
   if (conn && !conn.canReply) {
-    console.log(`business_message received but can_reply=false for connection ${connectionId}`);
+    console.log(`business_message: can_reply=false for connection ${connectionId}`);
     return;
   }
 
+  console.log(`business_message received | connection: ${connectionId} | chat: ${msg.chat.id}`);
   await handleIncomingMessage(msg, connectionId);
 });
 
@@ -212,13 +232,12 @@ bot.onText(/\/clear/, (msg) => {
 });
 
 bot.on("message", async (msg) => {
-  if (msg.business_connection_id) return; // handled by business_message
+  if (msg.business_connection_id) return;
   await handleIncomingMessage(msg, null);
 });
 
 bot.on("polling_error", (err) => {
-  const msg = err.message || err.code || "unknown error";
-  console.error("Polling error:", msg);
+  console.error("Polling error:", err.message || err.code || "unknown");
 });
 
 const modeLabel = FALLBACK_MODE ? "FALLBACK (template)" : "Claude Haiku";
