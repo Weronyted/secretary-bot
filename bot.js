@@ -23,6 +23,9 @@ const anthropic = new Anthropic({ apiKey: ANTHROPIC_API_KEY });
 const conversationHistory = new Map();
 const MAX_HISTORY = 10;
 
+// Business connections: Map<connectionId, { canReply: bool, userChatId: number }>
+const businessConnections = new Map();
+
 const SYSTEM_PROMPT = `You are a personal secretary of the bot owner. Your name is Alex.
 
 Your role:
@@ -59,7 +62,6 @@ function getHistory(chatId) {
 function pushToHistory(chatId, role, content) {
   const history = getHistory(chatId);
   history.push({ role, content });
-  // Keep only the last MAX_HISTORY messages
   if (history.length > MAX_HISTORY) {
     history.splice(0, history.length - MAX_HISTORY);
   }
@@ -95,26 +97,13 @@ async function getClaudeResponse(chatId, userMessage) {
   return assistantMessage;
 }
 
-// /start command
-bot.onText(/\/start/, (msg) => {
-  bot.sendMessage(msg.chat.id, START_MESSAGE);
-});
-
-// /clear command
-bot.onText(/\/clear/, (msg) => {
-  conversationHistory.delete(msg.chat.id);
-  bot.sendMessage(msg.chat.id, "✅ Conversation history cleared. Let's start fresh!");
-});
-
-// Handle all text messages
-bot.on("message", async (msg) => {
-  // Ignore commands (already handled above)
+async function handleIncomingMessage(msg, businessConnectionId) {
   if (!msg.text || msg.text.startsWith("/")) return;
 
   const chatId = msg.chat.id;
+  const sendOptions = businessConnectionId ? { business_connection_id: businessConnectionId } : {};
 
-  // Show typing indicator
-  bot.sendChatAction(chatId, "typing");
+  bot.sendChatAction(chatId, "typing", sendOptions);
 
   try {
     let reply;
@@ -135,14 +124,70 @@ bot.on("message", async (msg) => {
       }
     }
 
-    await bot.sendMessage(chatId, reply);
+    await bot.sendMessage(chatId, reply, sendOptions);
   } catch (err) {
     console.error("Error handling message:", err.message || err);
     await bot.sendMessage(
       chatId,
-      "Извините, произошла техническая ошибка. Пожалуйста, попробуйте позже.\n\nSorry, a technical error occurred. Please try again later."
+      "Извините, произошла техническая ошибка. Пожалуйста, попробуйте позже.\n\nSorry, a technical error occurred. Please try again later.",
+      sendOptions
     );
   }
+}
+
+// ── Secretary Mode: business connection lifecycle ────────────────────────────
+
+bot.on("business_connection", (connection) => {
+  const { id, is_enabled, can_reply, user } = connection;
+
+  if (is_enabled) {
+    businessConnections.set(id, { canReply: can_reply, userId: user.id });
+    console.log(`Business connection established: ${id} | can_reply=${can_reply} | user=${user.id}`);
+  } else {
+    businessConnections.delete(id);
+    console.log(`Business connection removed: ${id}`);
+  }
+});
+
+// Messages arriving in chats managed by the business connection
+bot.on("business_message", async (msg) => {
+  const connectionId = msg.business_connection_id;
+  const conn = businessConnections.get(connectionId);
+
+  // Only reply if we have write permission for this connection
+  if (!conn || !conn.canReply) {
+    console.log(`business_message received but can_reply=false for connection ${connectionId}`);
+    return;
+  }
+
+  await handleIncomingMessage(msg, connectionId);
+});
+
+// ── Regular bot messages ─────────────────────────────────────────────────────
+
+bot.onText(/\/start/, (msg) => {
+  // Deep link from "Manage Bot" button: /start bizChat<user_chat_id>
+  if (msg.text && msg.text.startsWith("/start bizChat")) {
+    const userChatId = msg.text.replace("/start bizChat", "").trim();
+    bot.sendMessage(
+      msg.chat.id,
+      `✅ Управление чатом ${userChatId} активно. Бот отвечает собеседникам от вашего имени.\n\n` +
+      `✅ Managing chat ${userChatId}. The bot is replying to contacts on your behalf.`
+    );
+    return;
+  }
+  bot.sendMessage(msg.chat.id, START_MESSAGE);
+});
+
+bot.onText(/\/clear/, (msg) => {
+  conversationHistory.delete(msg.chat.id);
+  bot.sendMessage(msg.chat.id, "✅ Conversation history cleared. Let's start fresh!");
+});
+
+bot.on("message", async (msg) => {
+  // Skip business messages (handled above) and commands
+  if (msg.business_connection_id) return;
+  await handleIncomingMessage(msg, null);
 });
 
 bot.on("polling_error", (err) => {
