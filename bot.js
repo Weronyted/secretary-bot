@@ -16,7 +16,19 @@ if (!ANTHROPIC_API_KEY && !FALLBACK_MODE) {
   FALLBACK_MODE = true;
 }
 
-const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
+const bot = new TelegramBot(TELEGRAM_TOKEN, {
+  polling: {
+    params: {
+      allowed_updates: [
+        "message",
+        "business_connection",
+        "business_message",
+        "edited_business_message",
+        "deleted_business_messages",
+      ],
+    },
+  },
+});
 const anthropic = new Anthropic({ apiKey: ANTHROPIC_API_KEY });
 
 const conversationHistory = new Map();
@@ -170,7 +182,9 @@ bot.on("business_message", async (msg) => {
   const connectionId = msg.business_connection_id;
   const conn = businessConnections.get(connectionId);
 
-  if (!conn || !conn.canReply) {
+  // If we missed the business_connection update (e.g. bot restarted), still reply.
+  // Telegram will return an error on sendMessage if can_reply is actually false.
+  if (conn && !conn.canReply) {
     console.log(`business_message received but can_reply=false for connection ${connectionId}`);
     return;
   }
