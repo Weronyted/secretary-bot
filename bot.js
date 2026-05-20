@@ -217,7 +217,8 @@ bot.on("message", async (msg) => {
 });
 
 bot.on("polling_error", (err) => {
-  console.error("Polling error:", err.message || err);
+  const msg = err.message || err.code || "unknown error";
+  console.error("Polling error:", msg);
 });
 
 const modeLabel = FALLBACK_MODE ? "FALLBACK (template)" : "Claude Haiku";
