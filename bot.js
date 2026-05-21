@@ -51,6 +51,25 @@ const stats = {
   startedAt: new Date(),
 };
 
+// Owner online tracking
+let ownerOnline = false;
+let ownerLastActivity = null;
+const OWNER_ONLINE_TIMEOUT_MS = 15 * 60 * 1000; // auto-expire after 15 min of inactivity
+
+function isOwnerOnline() {
+  if (!ownerOnline) return false;
+  if (!ownerLastActivity) return false;
+  if (Date.now() - ownerLastActivity > OWNER_ONLINE_TIMEOUT_MS) {
+    ownerOnline = false; // auto-expire
+    return false;
+  }
+  return true;
+}
+
+function touchOwnerActivity() {
+  ownerLastActivity = Date.now();
+}
+
 const URGENT_KEYWORDS = [
   "срочно", "срочная", "срочный", "urgent", "asap", "важно", "важный",
   "помогите", "помоги", "экстренно", "немедленно", "emergency",
@@ -161,16 +180,18 @@ async function getClaudeResponse(chatId, userMessage) {
   return reply;
 }
 
-// ── Urgent alert to owner ────────────────────────────────────────────────────
+// ── Notify / forward to owner ─────────────────────────────────────────────────
 
-async function notifyOwner(msg) {
+async function forwardToOwner(msg, urgent = false) {
   if (!OWNER_CHAT_ID) return;
   const user = userMemory.get(msg.chat.id);
   const name = user?.name || "Неизвестный";
   const chatId = msg.chat.id;
+  const icon = urgent ? "🚨" : "📩";
+  const label = urgent ? "*Срочное сообщение!*" : "*Новое сообщение*";
   await bot.sendMessage(
     OWNER_CHAT_ID,
-    `🚨 *Срочное сообщение!*\n\nОт: ${name} (chat: \`${chatId}\`)\n\n"${msg.text}"`,
+    `${icon} ${label}\n\nОт: ${name} (\`${chatId}\`)\n\n"${msg.text || "[медиа]"}"`,
     { parse_mode: "Markdown" }
   ).catch(() => {});
 }
@@ -188,17 +209,29 @@ async function handleIncomingMessage(msg, businessConnectionId) {
 
   const chatId = msg.chat.id;
   const sendOptions = businessConnectionId ? { business_connection_id: businessConnectionId } : {};
+  const hasText = msg.text && !msg.text.startsWith("/");
+
+  // ── Owner is online: forward silently, don't reply ──────────────────────────
+  if (isOwnerOnline()) {
+    if (hasText || isMediaMessage(msg)) {
+      await forwardToOwner(msg, hasText && isUrgent(msg.text));
+      console.log(`Forwarded to owner (online) from ${chatId}`);
+    }
+    return;
+  }
+
+  // ── Owner is offline: bot responds ──────────────────────────────────────────
 
   if (isMediaMessage(msg)) {
     await bot.sendMessage(chatId, MEDIA_REPLY, sendOptions);
     return;
   }
 
-  if (!msg.text || msg.text.startsWith("/")) return;
+  if (!hasText) return;
 
-  // Forward urgent messages to owner
+  // Forward urgent messages to owner even when offline
   if (isUrgent(msg.text)) {
-    await notifyOwner(msg);
+    await forwardToOwner(msg, true);
   }
 
   bot.sendChatAction(chatId, "typing", sendOptions).catch(() => {});
@@ -281,8 +314,10 @@ bot.onText(/\/mode (.+)/, (msg, match) => {
 bot.onText(/\/status/, (msg) => {
   if (!isOwner(msg.chat.id)) return;
   const mode = MODES[currentMode];
+  const onlineStatus = isOwnerOnline() ? "🟢 Онлайн (сообщения пересылаются)" : "🔴 Офлайн (бот отвечает)";
   const text =
     `📊 *Статус бота*\n\n` +
+    `Ты: ${onlineStatus}\n` +
     `Режим: ${mode.label}\n` +
     `Описание: ${mode.description}\n\n` +
     `📨 Сообщений обработано: ${stats.totalMessages}\n` +
@@ -312,6 +347,21 @@ bot.onText(/\/modes/, (msg) => {
   bot.sendMessage(msg.chat.id, `*Доступные режимы:*\n\n${list}`, { parse_mode: "Markdown" });
 });
 
+bot.onText(/\/online/, (msg) => {
+  if (!isOwner(msg.chat.id)) return;
+  ownerOnline = true;
+  touchOwnerActivity();
+  bot.sendMessage(msg.chat.id, "🟢 Ты онлайн. Все сообщения будут пересылаться тебе без ответа бота.\n\nАвто-офлайн через 15 минут неактивности.");
+  console.log("Owner: online");
+});
+
+bot.onText(/\/offline/, (msg) => {
+  if (!isOwner(msg.chat.id)) return;
+  ownerOnline = false;
+  bot.sendMessage(msg.chat.id, "🔴 Ты офлайн. Бот снова отвечает за тебя.");
+  console.log("Owner: offline");
+});
+
 // ── Regular commands ──────────────────────────────────────────────────────────
 
 bot.onText(/\/start/, (msg) => {
@@ -324,7 +374,7 @@ bot.onText(/\/start/, (msg) => {
     const list = Object.entries(MODES).map(([k, v]) => `• \`/mode ${k}\` — ${v.label}`).join("\n");
     return bot.sendMessage(
       msg.chat.id,
-      `👋 Привет, Умар! Я твой AI-секретарь.\n\n*Команды владельца:*\n${list}\n\n\`/status\` — статистика\n\`/digest\` — кто писал\n\`/modes\` — список режимов`,
+      `👋 Привет, Умар! Я твой AI-секретарь.\n\n*Режимы:*\n${list}\n\n*Присутствие:*\n• \`/online\` — ты онлайн, сообщения пересылаются тебе\n• \`/offline\` — ты офлайн, бот отвечает сам\n\n*Прочее:*\n• \`/status\` — статус и статистика\n• \`/digest\` — кто писал\n• \`/modes\` — список режимов`,
       { parse_mode: "Markdown" }
     );
   }
@@ -341,6 +391,11 @@ bot.onText(/\/clear/, (msg) => {
 
 bot.on("message", async (msg) => {
   if (msg.business_connection_id) return;
+  // Keep owner activity alive while they're using the bot
+  if (isOwner(msg.chat.id)) {
+    touchOwnerActivity();
+    return;
+  }
   if (!msg.text || msg.text.startsWith("/")) return;
   await handleIncomingMessage(msg, null);
 });
