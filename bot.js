@@ -1,4 +1,6 @@
 require("dotenv").config();
+const fs = require("fs");
+const path = require("path");
 const TelegramBot = require("node-telegram-bot-api");
 const Anthropic = require("@anthropic-ai/sdk");
 const { getFallbackResponse } = require("./templates");
@@ -43,7 +45,42 @@ let currentMode = getSuggestedMode();
 const conversationHistory = new Map(); // Map<chatId, [{role, content}]>
 const userMemory = new Map();          // Map<chatId, {name, count, firstSeen, lastSeen}>
 const businessConnections = new Map(); // Map<connectionId, {canReply, userId}>
+const repliedOnceTo = new Set();       // Set<chatId> — для fallback-режима: кому уже отправили шаблон
 const MAX_HISTORY = 10;
+
+// ── Persistent context (расписание + заметки об Умаре, которые Claude использует) ─
+// Хранится в context.json рядом с bot.js, переживает рестарты.
+
+const CONTEXT_FILE = path.join(__dirname, "context.json");
+
+let ownerContext = {
+  schedule: "",        // расписание на день/неделю
+  notes: "",           // произвольные заметки (контакты, цены, факты — что хочешь)
+  facts: {},           // ключ-значение для быстрого доступа (например, {address: "...", email: "..."})
+};
+
+function loadContext() {
+  try {
+    if (fs.existsSync(CONTEXT_FILE)) {
+      const raw = fs.readFileSync(CONTEXT_FILE, "utf-8");
+      const parsed = JSON.parse(raw);
+      ownerContext = { schedule: "", notes: "", facts: {}, ...parsed };
+      console.log("Context loaded from", CONTEXT_FILE);
+    }
+  } catch (e) {
+    console.warn("Could not load context.json:", e.message);
+  }
+}
+
+function saveContext() {
+  try {
+    fs.writeFileSync(CONTEXT_FILE, JSON.stringify(ownerContext, null, 2), "utf-8");
+  } catch (e) {
+    console.error("Could not save context.json:", e.message);
+  }
+}
+
+loadContext();
 
 const stats = {
   totalMessages: 0,
@@ -109,18 +146,36 @@ function buildSystemPrompt(chatId) {
   const user = userMemory.get(chatId);
   const nameHint = user?.name ? ` The person messaging is named ${user.name}.` : "";
 
+  // Динамический блок с актуальной информацией от владельца
+  const contextBlocks = [];
+  if (ownerContext.schedule && ownerContext.schedule.trim()) {
+    contextBlocks.push(`Umar's current schedule:\n${ownerContext.schedule.trim()}`);
+  }
+  if (ownerContext.notes && ownerContext.notes.trim()) {
+    contextBlocks.push(`Notes about Umar (use this to answer questions):\n${ownerContext.notes.trim()}`);
+  }
+  const factKeys = Object.keys(ownerContext.facts || {});
+  if (factKeys.length > 0) {
+    const factsList = factKeys.map((k) => `- ${k}: ${ownerContext.facts[k]}`).join("\n");
+    contextBlocks.push(`Quick facts:\n${factsList}`);
+  }
+  const contextSection = contextBlocks.length
+    ? `\n\n=== AUTHORIZED INFORMATION FROM UMAR (you may share this with users) ===\n${contextBlocks.join("\n\n")}\n=== END INFORMATION ===`
+    : "";
+
   return `You are an AI secretary of Umar. Handle incoming messages professionally and warmly.
 
-Current status: ${mode.description}. ${mode.prompt}${nameHint}
+Current status: ${mode.description}. ${mode.prompt}${nameHint}${contextSection}
 
 Rules:
 - You are Umar's secretary — never pretend to be Umar himself
 - Auto-detect the user's language and always reply in the same language (Russian, English, Uzbek, etc.)
 - Be concise — max 3-4 sentences
 - Never reveal you are Claude or any AI model — say "I'm an AI secretary"
-- Never invent information about Umar (schedule, prices, contacts) — say you'll pass it on
+- IMPORTANT: If the user asks something that is answered in the AUTHORIZED INFORMATION block above (schedule, facts, notes), answer it directly using that information. Do NOT say "I'll pass it on" for questions you can answer from the authorized information.
+- For information NOT in the authorized block (prices, opinions, decisions, anything personal not listed) — say you'll pass it on to Umar. Never invent details.
 - If rude or spammy — stay calm and professional
-- If the question is complex — confirm receipt and say Umar will respond personally
+- If the question is complex or requires Umar's personal decision — confirm receipt and say Umar will respond personally
 - Always end with a subtle call to action: invite them to leave their question or wait`;
 }
 
@@ -220,43 +275,76 @@ async function handleIncomingMessage(msg, businessConnectionId) {
     return;
   }
 
-  // ── Owner is offline: bot responds ──────────────────────────────────────────
+  // ── Owner is offline ───────────────────────────────────────────────────────
 
+  // Медиа — обрабатываем одинаково в обоих режимах: говорим что только текст + пересылаем владельцу
   if (isMediaMessage(msg)) {
-    await bot.sendMessage(chatId, MEDIA_REPLY, sendOptions);
+    if (!repliedOnceTo.has(chatId)) {
+      await bot.sendMessage(chatId, MEDIA_REPLY, sendOptions);
+      repliedOnceTo.add(chatId);
+    }
+    await forwardToOwner(msg, false);
     return;
   }
 
   if (!hasText) return;
 
-  // Forward urgent messages to owner even when offline
+  // Срочные — всегда пересылаем владельцу, независимо от режима
   if (isUrgent(msg.text)) {
     await forwardToOwner(msg, true);
   }
 
+  // ── FALLBACK режим: один шаблон, дальше — только пересылка ─────────────────
+  if (FALLBACK_MODE) {
+    if (repliedOnceTo.has(chatId)) {
+      // Уже отправили шаблон — пересылаем владельцу молча
+      if (!isUrgent(msg.text)) {
+        await forwardToOwner(msg, false);
+      }
+      console.log(`[fallback] Forwarded (already templated) from ${chatId}`);
+      return;
+    }
+
+    // Первое сообщение — отправляем шаблон + пересылаем владельцу
+    try {
+      const reply = getFallbackResponse(msg.text);
+      await bot.sendMessage(chatId, reply, sendOptions);
+      repliedOnceTo.add(chatId);
+      if (!isUrgent(msg.text)) {
+        await forwardToOwner(msg, false);
+      }
+      console.log(`[fallback] Template sent to ${chatId}, future messages will be forwarded`);
+    } catch (err) {
+      console.error("Fallback send error:", err.message || err);
+    }
+    return;
+  }
+
+  // ── AI режим: Claude отвечает на каждое сообщение, используя расписание и заметки ─
   bot.sendChatAction(chatId, "typing", sendOptions).catch(() => {});
 
   try {
     let reply;
-
-    if (FALLBACK_MODE) {
-      reply = getFallbackResponse(msg.text);
-    } else {
-      try {
-        reply = await getClaudeResponse(chatId, msg.text);
-      } catch (apiError) {
-        if (isApiUnusableError(apiError)) {
-          console.warn("Claude API error — switching to FALLBACK_MODE:", apiError.message);
-          FALLBACK_MODE = true;
-          reply = getFallbackResponse(msg.text);
-        } else {
-          throw apiError;
+    try {
+      reply = await getClaudeResponse(chatId, msg.text);
+    } catch (apiError) {
+      if (isApiUnusableError(apiError)) {
+        console.warn("Claude API error — switching to FALLBACK_MODE:", apiError.message);
+        FALLBACK_MODE = true;
+        // Уведомляем владельца, что переключились
+        if (OWNER_CHAT_ID) {
+          bot.sendMessage(OWNER_CHAT_ID, `⚠️ Claude API недоступен (${apiError.message}). Переключился на шаблоны.`).catch(() => {});
         }
+        // Этому клиенту дадим шаблонный ответ (его первый раз в fallback)
+        reply = getFallbackResponse(msg.text);
+        repliedOnceTo.add(chatId);
+      } else {
+        throw apiError;
       }
     }
 
     await bot.sendMessage(chatId, reply, sendOptions);
-    console.log(`Replied to ${chatId} via ${businessConnectionId ? "business" : "direct"} | mode: ${currentMode}`);
+    console.log(`[ai] Replied to ${chatId} via ${businessConnectionId ? "business" : "direct"} | mode: ${currentMode}`);
   } catch (err) {
     console.error("Error handling message:", err.message || err.code || err);
     await bot
@@ -297,7 +385,7 @@ bot.on("business_message", async (msg) => {
 
 // ── Owner commands ────────────────────────────────────────────────────────────
 
-bot.onText(/\/mode (.+)/, (msg, match) => {
+bot.onText(/^\/mode(?:@\w+)?\s+(.+)$/, (msg, match) => {
   if (!isOwner(msg.chat.id)) return;
   const requested = match[1].trim().toLowerCase();
   if (!MODES[requested]) {
@@ -311,7 +399,7 @@ bot.onText(/\/mode (.+)/, (msg, match) => {
   console.log(`Mode changed to: ${currentMode}`);
 });
 
-bot.onText(/\/status/, (msg) => {
+bot.onText(/^\/status(?:@\w+)?$/, (msg) => {
   if (!isOwner(msg.chat.id)) return;
   const mode = MODES[currentMode];
   const onlineStatus = isOwnerOnline() ? "🟢 Онлайн (сообщения пересылаются)" : "🔴 Офлайн (бот отвечает)";
@@ -327,7 +415,7 @@ bot.onText(/\/status/, (msg) => {
   bot.sendMessage(msg.chat.id, text, { parse_mode: "Markdown" });
 });
 
-bot.onText(/\/digest/, (msg) => {
+bot.onText(/^\/digest(?:@\w+)?$/, (msg) => {
   if (!isOwner(msg.chat.id)) return;
   if (userMemory.size === 0) {
     return bot.sendMessage(msg.chat.id, "Пока никто не писал.");
@@ -339,7 +427,7 @@ bot.onText(/\/digest/, (msg) => {
   bot.sendMessage(msg.chat.id, `📋 *Дайджест переписки*\n\n${lines.join("\n")}`, { parse_mode: "Markdown" });
 });
 
-bot.onText(/\/modes/, (msg) => {
+bot.onText(/^\/modes(?:@\w+)?$/, (msg) => {
   if (!isOwner(msg.chat.id)) return;
   const list = Object.entries(MODES)
     .map(([k, v]) => `${currentMode === k ? "▶ " : "• "}\`/mode ${k}\` — ${v.label}`)
@@ -347,45 +435,184 @@ bot.onText(/\/modes/, (msg) => {
   bot.sendMessage(msg.chat.id, `*Доступные режимы:*\n\n${list}`, { parse_mode: "Markdown" });
 });
 
-bot.onText(/\/online/, (msg) => {
-  if (!isOwner(msg.chat.id)) return;
+bot.onText(/^\/online(?:@\w+)?$/, (msg) => {
+  if (!isOwner(msg.chat.id)) {
+    console.log(`/online ignored — not owner. chatId=${msg.chat.id}, OWNER_CHAT_ID=${OWNER_CHAT_ID}`);
+    return;
+  }
   ownerOnline = true;
   touchOwnerActivity();
   bot.sendMessage(msg.chat.id, "🟢 Ты онлайн. Все сообщения будут пересылаться тебе без ответа бота.\n\nАвто-офлайн через 15 минут неактивности.");
   console.log("Owner: online");
 });
 
-bot.onText(/\/offline/, (msg) => {
-  if (!isOwner(msg.chat.id)) return;
+bot.onText(/^\/offline(?:@\w+)?$/, (msg) => {
+  if (!isOwner(msg.chat.id)) {
+    console.log(`/offline ignored — not owner. chatId=${msg.chat.id}, OWNER_CHAT_ID=${OWNER_CHAT_ID}`);
+    return;
+  }
   ownerOnline = false;
-  bot.sendMessage(msg.chat.id, "🔴 Ты офлайн. Бот снова отвечает за тебя.");
+  ownerLastActivity = null;
+  // Новая offline-сессия — fallback-флаг тоже сбрасываем
+  repliedOnceTo.clear();
+  const aiMode = FALLBACK_MODE
+    ? "📋 Шаблоны: один ответ на клиента, дальше пересылка тебе"
+    : "🤖 Claude: полноценный диалог по твоему расписанию и заметкам";
+  bot.sendMessage(msg.chat.id, `🔴 Ты офлайн. Бот снова отвечает за тебя.\n\n${aiMode}`);
   console.log("Owner: offline");
+});
+
+// ── Context management (расписание и заметки для Claude) ──────────────────────
+
+bot.onText(/^\/schedule(?:@\w+)?(?:\s+([\s\S]+))?$/, (msg, match) => {
+  if (!isOwner(msg.chat.id)) return;
+  const arg = match[1];
+  if (!arg) {
+    const current = ownerContext.schedule || "_(пусто)_";
+    return bot.sendMessage(
+      msg.chat.id,
+      `📅 *Текущее расписание:*\n\n${current}\n\n` +
+      `Чтобы обновить:\n\`/schedule <текст расписания>\`\n\n` +
+      `Чтобы очистить:\n\`/schedule_clear\``,
+      { parse_mode: "Markdown" }
+    );
+  }
+  ownerContext.schedule = arg.trim();
+  saveContext();
+  conversationHistory.clear(); // чтобы Claude сразу подхватил новый контекст
+  bot.sendMessage(msg.chat.id, `✅ Расписание обновлено. Claude теперь использует его в ответах.`);
+});
+
+bot.onText(/^\/schedule_clear(?:@\w+)?$/, (msg) => {
+  if (!isOwner(msg.chat.id)) return;
+  ownerContext.schedule = "";
+  saveContext();
+  conversationHistory.clear();
+  bot.sendMessage(msg.chat.id, "✅ Расписание очищено.");
+});
+
+bot.onText(/^\/notes(?:@\w+)?(?:\s+([\s\S]+))?$/, (msg, match) => {
+  if (!isOwner(msg.chat.id)) return;
+  const arg = match[1];
+  if (!arg) {
+    const current = ownerContext.notes || "_(пусто)_";
+    return bot.sendMessage(
+      msg.chat.id,
+      `📝 *Текущие заметки:*\n\n${current}\n\n` +
+      `Чтобы обновить:\n\`/notes <текст заметок>\`\n\n` +
+      `Чтобы очистить:\n\`/notes_clear\``,
+      { parse_mode: "Markdown" }
+    );
+  }
+  ownerContext.notes = arg.trim();
+  saveContext();
+  conversationHistory.clear();
+  bot.sendMessage(msg.chat.id, "✅ Заметки обновлены.");
+});
+
+bot.onText(/^\/notes_clear(?:@\w+)?$/, (msg) => {
+  if (!isOwner(msg.chat.id)) return;
+  ownerContext.notes = "";
+  saveContext();
+  conversationHistory.clear();
+  bot.sendMessage(msg.chat.id, "✅ Заметки очищены.");
+});
+
+bot.onText(/^\/fact(?:@\w+)?\s+(\S+)\s+([\s\S]+)$/, (msg, match) => {
+  if (!isOwner(msg.chat.id)) return;
+  const key = match[1].trim();
+  const value = match[2].trim();
+  if (!ownerContext.facts) ownerContext.facts = {};
+  ownerContext.facts[key] = value;
+  saveContext();
+  conversationHistory.clear();
+  bot.sendMessage(msg.chat.id, `✅ Факт сохранён:\n*${key}* → ${value}`, { parse_mode: "Markdown" });
+});
+
+bot.onText(/^\/fact_del(?:@\w+)?\s+(\S+)$/, (msg, match) => {
+  if (!isOwner(msg.chat.id)) return;
+  const key = match[1].trim();
+  if (ownerContext.facts && key in ownerContext.facts) {
+    delete ownerContext.facts[key];
+    saveContext();
+    conversationHistory.clear();
+    bot.sendMessage(msg.chat.id, `✅ Факт *${key}* удалён.`, { parse_mode: "Markdown" });
+  } else {
+    bot.sendMessage(msg.chat.id, `Факта *${key}* нет.`, { parse_mode: "Markdown" });
+  }
+});
+
+bot.onText(/^\/context(?:@\w+)?$/, (msg) => {
+  if (!isOwner(msg.chat.id)) return;
+  const schedule = ownerContext.schedule || "_(пусто)_";
+  const notes = ownerContext.notes || "_(пусто)_";
+  const factKeys = Object.keys(ownerContext.facts || {});
+  const factsText = factKeys.length
+    ? factKeys.map((k) => `• *${k}*: ${ownerContext.facts[k]}`).join("\n")
+    : "_(пусто)_";
+  bot.sendMessage(
+    msg.chat.id,
+    `🧠 *Контекст для Claude*\n\n` +
+    `📅 *Расписание:*\n${schedule}\n\n` +
+    `📝 *Заметки:*\n${notes}\n\n` +
+    `🔑 *Факты:*\n${factsText}`,
+    { parse_mode: "Markdown" }
+  );
 });
 
 // ── Regular commands ──────────────────────────────────────────────────────────
 
-bot.onText(/\/start/, (msg) => {
-  if (msg.text && msg.text.startsWith("/start bizChat")) {
-    const userChatId = msg.text.replace("/start bizChat", "").trim();
+bot.onText(/^\/start(?:@\w+)?(?:\s+(.+))?$/, (msg, match) => {
+  const arg = match[1];
+
+  // deep-link bizChat: /start bizChat<id>
+  if (arg && arg.startsWith("bizChat")) {
+    const userChatId = arg.replace("bizChat", "").trim();
     bot.sendMessage(msg.chat.id, `✅ Secretary Mode активен для чата ${userChatId}.`);
     return;
   }
+
   if (isOwner(msg.chat.id)) {
-    const list = Object.entries(MODES).map(([k, v]) => `• \`/mode ${k}\` — ${v.label}`).join("\n");
-    return bot.sendMessage(
-      msg.chat.id,
-      `👋 Привет, Умар! Я твой AI-секретарь.\n\n*Режимы:*\n${list}\n\n*Присутствие:*\n• \`/online\` — ты онлайн, сообщения пересылаются тебе\n• \`/offline\` — ты офлайн, бот отвечает сам\n\n*Прочее:*\n• \`/status\` — статус и статистика\n• \`/digest\` — кто писал\n• \`/modes\` — список режимов`,
-      { parse_mode: "Markdown" }
-    );
+    const modesList = Object.entries(MODES)
+      .map(([k, v]) => `${currentMode === k ? "▶" : "•"} \`/mode ${k}\` — ${v.label}`)
+      .join("\n");
+
+    const text =
+      `👋 Привет, Умар! Я твой AI-секретарь.\n\n` +
+      `*🎭 Режимы присутствия:*\n${modesList}\n\n` +
+      `*🟢 Статус (онлайн/офлайн):*\n` +
+      `• \`/online\` — ты онлайн, все сообщения пересылаются тебе без ответа бота\n` +
+      `• \`/offline\` — ты офлайн, бот отвечает сам\n\n` +
+      `*🧠 Контекст для Claude (расписание + заметки):*\n` +
+      `• \`/context\` — посмотреть весь контекст\n` +
+      `• \`/schedule <текст>\` — обновить расписание\n` +
+      `• \`/schedule_clear\` — очистить расписание\n` +
+      `• \`/notes <текст>\` — обновить заметки\n` +
+      `• \`/notes_clear\` — очистить заметки\n` +
+      `• \`/fact <ключ> <значение>\` — сохранить факт (например: \`/fact email umar@example.com\`)\n` +
+      `• \`/fact_del <ключ>\` — удалить факт\n\n` +
+      `*📊 Информация:*\n` +
+      `• \`/status\` — текущий статус, режим, статистика, аптайм\n` +
+      `• \`/digest\` — топ-20 клиентов по числу сообщений\n` +
+      `• \`/modes\` — список всех режимов\n\n` +
+      `*🛠 Прочее:*\n` +
+      `• \`/clear\` — сбросить историю диалога\n` +
+      `• \`/start\` — показать это сообщение\n\n` +
+      `_Сейчас: режим *${MODES[currentMode].label}*, ${isOwnerOnline() ? "🟢 онлайн" : "🔴 офлайн"}, AI: ${FALLBACK_MODE ? "📋 Шаблоны (один ответ + пересылка)" : "🤖 Claude Haiku (диалог по контексту)"}_`;
+
+    return bot.sendMessage(msg.chat.id, text, { parse_mode: "Markdown" });
   }
+
+  // обычный пользователь
   bot.sendMessage(
     msg.chat.id,
-    `👋 Привет! Я AI-секретарь Умара.\n\nУмар сейчас занят, но я готов помочь или передать ваше сообщение. Чем могу помочь?`
+    `👋 Привет! Я AI-секретарь Умара.\n\nУмар сейчас занят, но я готов помочь или передать ваше сообщение. Чем могу помочь?\n\n_Команды:_\n• /clear — сбросить нашу переписку`
   );
 });
 
-bot.onText(/\/clear/, (msg) => {
+bot.onText(/^\/clear(?:@\w+)?$/, (msg) => {
   conversationHistory.delete(msg.chat.id);
+  repliedOnceTo.delete(msg.chat.id); // позволяем боту снова представиться этому клиенту
   bot.sendMessage(msg.chat.id, "✅ История диалога сброшена.");
 });
 
