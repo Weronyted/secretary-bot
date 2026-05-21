@@ -2,9 +2,11 @@ require("dotenv").config();
 const TelegramBot = require("node-telegram-bot-api");
 const Anthropic = require("@anthropic-ai/sdk");
 const { getFallbackResponse } = require("./templates");
+const { MODES, getSuggestedMode } = require("./modes");
 
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
+const OWNER_CHAT_ID = process.env.OWNER_CHAT_ID ? Number(process.env.OWNER_CHAT_ID) : null;
 let FALLBACK_MODE = process.env.FALLBACK_MODE === "true";
 
 if (!TELEGRAM_TOKEN) {
@@ -14,6 +16,9 @@ if (!TELEGRAM_TOKEN) {
 if (!ANTHROPIC_API_KEY && !FALLBACK_MODE) {
   console.warn("Warning: ANTHROPIC_API_KEY is not set. Switching to FALLBACK_MODE.");
   FALLBACK_MODE = true;
+}
+if (!OWNER_CHAT_ID) {
+  console.warn("Warning: OWNER_CHAT_ID is not set. Owner commands and urgent alerts disabled.");
 }
 
 const bot = new TelegramBot(TELEGRAM_TOKEN, {
@@ -32,55 +37,83 @@ const bot = new TelegramBot(TELEGRAM_TOKEN, {
 
 const anthropic = new Anthropic({ apiKey: ANTHROPIC_API_KEY });
 
-const conversationHistory = new Map();
+// ── State ────────────────────────────────────────────────────────────────────
+
+let currentMode = getSuggestedMode();
+const conversationHistory = new Map(); // Map<chatId, [{role, content}]>
+const userMemory = new Map();          // Map<chatId, {name, count, firstSeen, lastSeen}>
+const businessConnections = new Map(); // Map<connectionId, {canReply, userId}>
 const MAX_HISTORY = 10;
 
-// Business connections: Map<connectionId, { canReply: bool, userId: number }>
-const businessConnections = new Map();
+const stats = {
+  totalMessages: 0,
+  uniqueChats: new Set(),
+  startedAt: new Date(),
+};
 
-const SYSTEM_PROMPT = `You are an AI secretary of Umar. Your job is to handle incoming messages professionally and warmly.
+const URGENT_KEYWORDS = [
+  "срочно", "срочная", "срочный", "urgent", "asap", "важно", "важный",
+  "помогите", "помоги", "экстренно", "немедленно", "emergency",
+];
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
+
+function isOwner(chatId) {
+  return OWNER_CHAT_ID && Number(chatId) === OWNER_CHAT_ID;
+}
+
+function isUrgent(text) {
+  const lower = text.toLowerCase();
+  return URGENT_KEYWORDS.some((kw) => lower.includes(kw));
+}
+
+function updateUserMemory(msg) {
+  const chatId = msg.chat.id;
+  const name = msg.from
+    ? [msg.from.first_name, msg.from.last_name].filter(Boolean).join(" ")
+    : msg.chat.first_name || "Unknown";
+
+  if (!userMemory.has(chatId)) {
+    userMemory.set(chatId, { name, count: 0, firstSeen: new Date(), lastSeen: new Date() });
+  }
+  const mem = userMemory.get(chatId);
+  mem.count += 1;
+  mem.lastSeen = new Date();
+  if (name && name !== "Unknown") mem.name = name;
+
+  stats.totalMessages += 1;
+  stats.uniqueChats.add(chatId);
+}
+
+function buildSystemPrompt(chatId) {
+  const mode = MODES[currentMode];
+  const user = userMemory.get(chatId);
+  const nameHint = user?.name ? ` The person messaging is named ${user.name}.` : "";
+
+  return `You are an AI secretary of Umar. Handle incoming messages professionally and warmly.
+
+Current status: ${mode.description}. ${mode.prompt}${nameHint}
 
 Rules:
-- You are the secretary of Umar. Never pretend to be Umar himself — always clarify you are his personal AI secretary
-- Auto-detect the user's language and always reply in the same language (Russian → Russian, English → English, Uzbek → Uzbek, etc.)
-- Be concise — max 3-4 sentences per reply
-- Never reveal that you are Claude or any AI model — just say "I'm an AI secretary"
-- Never make up information about Umar (schedule, prices, contacts) — say you'll pass it on
-- If someone asks something specific about Umar's work or services — acknowledge their question and say Umar will respond personally
-- If someone is rude or sends spam — stay calm and professional, do not mirror their tone
-- Greet warmly and introduce yourself as Umar's AI secretary when appropriate
-- For urgent messages — acknowledge the urgency and promise to notify Umar immediately
-- For compliments or thanks — respond warmly on behalf of Umar
-- Always end replies with a subtle call to action: invite them to leave their question or wait for Umar`;
-
-const START_MESSAGE = `👋 Привет! Я AI-секретарь Умара.
-
-Умар сейчас занят, но я готов помочь или передать ваше сообщение.
-
-• Задайте вопрос — отвечу если смогу, или передам Умару
-• Оставьте сообщение — он обязательно ответит
-
-Команды:
-/start — это сообщение
-/clear — сбросить историю диалога
-
-Чем могу помочь?`;
-
-const MEDIA_REPLY = "Я пока обрабатываю только текстовые сообщения. Напишите ваш вопрос текстом — передам Умару.\n\nI can only process text messages for now. Please write your question — I'll pass it on to Umar.";
+- You are Umar's secretary — never pretend to be Umar himself
+- Auto-detect the user's language and always reply in the same language (Russian, English, Uzbek, etc.)
+- Be concise — max 3-4 sentences
+- Never reveal you are Claude or any AI model — say "I'm an AI secretary"
+- Never invent information about Umar (schedule, prices, contacts) — say you'll pass it on
+- If rude or spammy — stay calm and professional
+- If the question is complex — confirm receipt and say Umar will respond personally
+- Always end with a subtle call to action: invite them to leave their question or wait`;
+}
 
 function getHistory(chatId) {
-  if (!conversationHistory.has(chatId)) {
-    conversationHistory.set(chatId, []);
-  }
+  if (!conversationHistory.has(chatId)) conversationHistory.set(chatId, []);
   return conversationHistory.get(chatId);
 }
 
 function pushToHistory(chatId, role, content) {
   const history = getHistory(chatId);
   history.push({ role, content });
-  if (history.length > MAX_HISTORY) {
-    history.splice(0, history.length - MAX_HISTORY);
-  }
+  if (history.length > MAX_HISTORY) history.splice(0, history.length - MAX_HISTORY);
 }
 
 function isApiUnusableError(error) {
@@ -99,6 +132,19 @@ function isApiUnusableError(error) {
   );
 }
 
+function isMediaMessage(msg) {
+  return !!(msg.photo || msg.voice || msg.video || msg.document || msg.audio || msg.sticker || msg.video_note);
+}
+
+function formatUptime() {
+  const ms = Date.now() - stats.startedAt.getTime();
+  const h = Math.floor(ms / 3600000);
+  const m = Math.floor((ms % 3600000) / 60000);
+  return `${h}ч ${m}м`;
+}
+
+// ── Claude ───────────────────────────────────────────────────────────────────
+
 async function getClaudeResponse(chatId, userMessage) {
   pushToHistory(chatId, "user", userMessage);
   const history = getHistory(chatId);
@@ -106,20 +152,40 @@ async function getClaudeResponse(chatId, userMessage) {
   const response = await anthropic.messages.create({
     model: "claude-haiku-4-5",
     max_tokens: 512,
-    system: SYSTEM_PROMPT,
+    system: buildSystemPrompt(chatId),
     messages: history,
   });
 
-  const assistantMessage = response.content[0].text;
-  pushToHistory(chatId, "assistant", assistantMessage);
-  return assistantMessage;
+  const reply = response.content[0].text;
+  pushToHistory(chatId, "assistant", reply);
+  return reply;
 }
 
-function isMediaMessage(msg) {
-  return !!(msg.photo || msg.voice || msg.video || msg.document || msg.audio || msg.sticker || msg.video_note);
+// ── Urgent alert to owner ────────────────────────────────────────────────────
+
+async function notifyOwner(msg) {
+  if (!OWNER_CHAT_ID) return;
+  const user = userMemory.get(msg.chat.id);
+  const name = user?.name || "Неизвестный";
+  const chatId = msg.chat.id;
+  await bot.sendMessage(
+    OWNER_CHAT_ID,
+    `🚨 *Срочное сообщение!*\n\nОт: ${name} (chat: \`${chatId}\`)\n\n"${msg.text}"`,
+    { parse_mode: "Markdown" }
+  ).catch(() => {});
 }
+
+// ── Message handler ──────────────────────────────────────────────────────────
+
+const MEDIA_REPLY =
+  "Я пока обрабатываю только текстовые сообщения. Напишите ваш вопрос текстом — передам Умару.\n\n" +
+  "I can only process text messages for now. Please write your question — I'll pass it on to Umar.";
 
 async function handleIncomingMessage(msg, businessConnectionId) {
+  if (isOwner(msg.chat.id)) return; // owner commands handled separately
+
+  updateUserMemory(msg);
+
   const chatId = msg.chat.id;
   const sendOptions = businessConnectionId ? { business_connection_id: businessConnectionId } : {};
 
@@ -129,6 +195,11 @@ async function handleIncomingMessage(msg, businessConnectionId) {
   }
 
   if (!msg.text || msg.text.startsWith("/")) return;
+
+  // Forward urgent messages to owner
+  if (isUrgent(msg.text)) {
+    await notifyOwner(msg);
+  }
 
   bot.sendChatAction(chatId, "typing", sendOptions).catch(() => {});
 
@@ -152,49 +223,32 @@ async function handleIncomingMessage(msg, businessConnectionId) {
     }
 
     await bot.sendMessage(chatId, reply, sendOptions);
-    console.log(`Replied to chat ${chatId} via ${businessConnectionId ? "business" : "direct"}`);
+    console.log(`Replied to ${chatId} via ${businessConnectionId ? "business" : "direct"} | mode: ${currentMode}`);
   } catch (err) {
     console.error("Error handling message:", err.message || err.code || err);
-    await bot.sendMessage(
-      chatId,
-      "Извините, произошла техническая ошибка. Пожалуйста, попробуйте позже.",
-      sendOptions
-    ).catch(() => {});
+    await bot
+      .sendMessage(chatId, "Извините, произошла техническая ошибка. Попробуйте позже.", sendOptions)
+      .catch(() => {});
   }
 }
 
-// ── Patch processUpdate to handle business update types ──────────────────────
-// node-telegram-bot-api doesn't natively support business_* update types,
-// so we intercept raw updates and emit our own events.
+// ── Patch processUpdate for business updates ─────────────────────────────────
+
 const _processUpdate = bot.processUpdate.bind(bot);
 bot.processUpdate = function (update) {
-  if (update.business_connection) {
-    bot.emit("business_connection", update.business_connection);
-    return;
-  }
-  if (update.business_message) {
-    bot.emit("business_message", update.business_message);
-    return;
-  }
-  if (update.edited_business_message) {
-    // ignore edits for now
-    return;
-  }
-  if (update.deleted_business_messages) {
-    // ignore deletions for now
-    return;
-  }
+  if (update.business_connection) { bot.emit("business_connection", update.business_connection); return; }
+  if (update.business_message) { bot.emit("business_message", update.business_message); return; }
+  if (update.edited_business_message || update.deleted_business_messages) return;
   _processUpdate(update);
 };
 
-// ── Secretary Mode: business connection lifecycle ────────────────────────────
+// ── Business connection lifecycle ─────────────────────────────────────────────
 
 bot.on("business_connection", (connection) => {
   const { id, is_enabled, can_reply, user } = connection;
-
   if (is_enabled) {
     businessConnections.set(id, { canReply: can_reply, userId: user.id });
-    console.log(`Business connection established: ${id} | can_reply=${can_reply} | user=${user.id}`);
+    console.log(`Business connection: ${id} | can_reply=${can_reply}`);
   } else {
     businessConnections.delete(id);
     console.log(`Business connection removed: ${id}`);
@@ -204,28 +258,80 @@ bot.on("business_connection", (connection) => {
 bot.on("business_message", async (msg) => {
   const connectionId = msg.business_connection_id;
   const conn = businessConnections.get(connectionId);
-
-  if (conn && !conn.canReply) {
-    console.log(`business_message: can_reply=false for connection ${connectionId}`);
-    return;
-  }
-
-  console.log(`business_message received | connection: ${connectionId} | chat: ${msg.chat.id}`);
+  if (conn && !conn.canReply) return;
   await handleIncomingMessage(msg, connectionId);
 });
 
-// ── Regular bot messages ─────────────────────────────────────────────────────
+// ── Owner commands ────────────────────────────────────────────────────────────
+
+bot.onText(/\/mode (.+)/, (msg, match) => {
+  if (!isOwner(msg.chat.id)) return;
+  const requested = match[1].trim().toLowerCase();
+  if (!MODES[requested]) {
+    const list = Object.keys(MODES).map((k) => `• \`${k}\` — ${MODES[k].label}`).join("\n");
+    return bot.sendMessage(msg.chat.id, `Неизвестный режим. Доступные:\n\n${list}`, { parse_mode: "Markdown" });
+  }
+  currentMode = requested;
+  // Clear all histories so Claude picks up the new mode context
+  conversationHistory.clear();
+  bot.sendMessage(msg.chat.id, `✅ Режим изменён: *${MODES[currentMode].label}*`, { parse_mode: "Markdown" });
+  console.log(`Mode changed to: ${currentMode}`);
+});
+
+bot.onText(/\/status/, (msg) => {
+  if (!isOwner(msg.chat.id)) return;
+  const mode = MODES[currentMode];
+  const text =
+    `📊 *Статус бота*\n\n` +
+    `Режим: ${mode.label}\n` +
+    `Описание: ${mode.description}\n\n` +
+    `📨 Сообщений обработано: ${stats.totalMessages}\n` +
+    `👥 Уникальных чатов: ${stats.uniqueChats.size}\n` +
+    `⏱ Аптайм: ${formatUptime()}\n` +
+    `🤖 Режим AI: ${FALLBACK_MODE ? "Шаблоны (fallback)" : "Claude Haiku"}`;
+  bot.sendMessage(msg.chat.id, text, { parse_mode: "Markdown" });
+});
+
+bot.onText(/\/digest/, (msg) => {
+  if (!isOwner(msg.chat.id)) return;
+  if (userMemory.size === 0) {
+    return bot.sendMessage(msg.chat.id, "Пока никто не писал.");
+  }
+  const lines = [...userMemory.entries()]
+    .sort((a, b) => b[1].count - a[1].count)
+    .slice(0, 20)
+    .map(([chatId, u]) => `• ${u.name} (${chatId}) — ${u.count} сообщ., последнее: ${u.lastSeen.toLocaleTimeString("ru")}`);
+  bot.sendMessage(msg.chat.id, `📋 *Дайджест переписки*\n\n${lines.join("\n")}`, { parse_mode: "Markdown" });
+});
+
+bot.onText(/\/modes/, (msg) => {
+  if (!isOwner(msg.chat.id)) return;
+  const list = Object.entries(MODES)
+    .map(([k, v]) => `${currentMode === k ? "▶ " : "• "}\`/mode ${k}\` — ${v.label}`)
+    .join("\n");
+  bot.sendMessage(msg.chat.id, `*Доступные режимы:*\n\n${list}`, { parse_mode: "Markdown" });
+});
+
+// ── Regular commands ──────────────────────────────────────────────────────────
 
 bot.onText(/\/start/, (msg) => {
   if (msg.text && msg.text.startsWith("/start bizChat")) {
     const userChatId = msg.text.replace("/start bizChat", "").trim();
-    bot.sendMessage(
-      msg.chat.id,
-      `✅ Secretary Mode активен для чата ${userChatId}.\nБот отвечает собеседникам от имени Умара.`
-    );
+    bot.sendMessage(msg.chat.id, `✅ Secretary Mode активен для чата ${userChatId}.`);
     return;
   }
-  bot.sendMessage(msg.chat.id, START_MESSAGE);
+  if (isOwner(msg.chat.id)) {
+    const list = Object.entries(MODES).map(([k, v]) => `• \`/mode ${k}\` — ${v.label}`).join("\n");
+    return bot.sendMessage(
+      msg.chat.id,
+      `👋 Привет, Умар! Я твой AI-секретарь.\n\n*Команды владельца:*\n${list}\n\n\`/status\` — статистика\n\`/digest\` — кто писал\n\`/modes\` — список режимов`,
+      { parse_mode: "Markdown" }
+    );
+  }
+  bot.sendMessage(
+    msg.chat.id,
+    `👋 Привет! Я AI-секретарь Умара.\n\nУмар сейчас занят, но я готов помочь или передать ваше сообщение. Чем могу помочь?`
+  );
 });
 
 bot.onText(/\/clear/, (msg) => {
@@ -235,6 +341,7 @@ bot.onText(/\/clear/, (msg) => {
 
 bot.on("message", async (msg) => {
   if (msg.business_connection_id) return;
+  if (!msg.text || msg.text.startsWith("/")) return;
   await handleIncomingMessage(msg, null);
 });
 
@@ -243,4 +350,4 @@ bot.on("polling_error", (err) => {
 });
 
 const modeLabel = FALLBACK_MODE ? "FALLBACK (template)" : "Claude Haiku";
-console.log(`Secretary bot is running in ${modeLabel} mode...`);
+console.log(`Secretary bot running | mode: ${currentMode} | AI: ${modeLabel}`);
